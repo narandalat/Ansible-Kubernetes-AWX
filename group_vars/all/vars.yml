@@ -1,0 +1,8 @@
+# Variables globales a todos los ambientes
+empresa_nombre: "MiEmpresa"
+ntp_server: "time.empresa.com"
+dns_servers:
+  - 8.8.8.8
+  - 8.8.4.4
+log_dir: /var/log/empresa
+backup_dir: /opt/backups

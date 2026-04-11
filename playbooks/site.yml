@@ -1,0 +1,23 @@
+---
+# Orquesta la configuración completa de la infraestructura
+- name: Configuración base de todos los servidores
+  hosts: all
+  roles:
+    - common
+    - monitoring
+
+- name: Servidores web
+  hosts: web_servers
+  roles:
+    - nginx
+
+- name: Servidores de aplicación
+  hosts: app_servers
+  roles:
+    - java
+    - deploy_app
+
+- name: Servidores de base de datos
+  hosts: db_servers
+  roles:
+    - postgresql
