@@ -1,0 +1,8 @@
+# Nunca subir esto a Git
+*.retry
+.vault_pass
+*.pem
+*.key
+*.log
+.env
+__pycache__/

@@ -1,0 +1,4 @@
+# Este archivo va encriptado en Git
+vault_db_password: "supersecreto123"
+vault_api_key: "abc123xyz"
+vault_ssh_key: "{{ lookup('file', '~/.ssh/id_rsa') }}"
