@@ -884,11 +884,11 @@ Contraseña: la obtenida en el paso anterior
 # Inicializar Git en la carpeta del proyecto
 git init
 
-# Conectar con GitLab
-git remote add origin https://gitlab.com/tu-usuario/tu-repo.git
+# Conectar con GitHub
+git remote add origin https://github.com/tu-usuario/tu-repo.git
 
-# Configurar credencial (usar Personal Access Token de GitLab)
-git remote set-url origin https://tu-usuario:TU_TOKEN@gitlab.com/tu-usuario/tu-repo.git
+# Configurar credencial (usar Personal Access Token de GitHub)
+git remote set-url origin https://tu-usuario:TU_TOKEN@github.com/tu-usuario/tu-repo.git
 
 # Crear rama main y rama de trabajo
 git checkout -b main
@@ -900,38 +900,246 @@ git commit -m "feat: estructura inicial del proyecto"
 git push -u origin tu-rama-local
 ```
 
-Desde GitLab crear un Merge Request de `tu-rama-local` → `main` y aprobarlo.
+Desde GitHub crear un Pull Request de `tu-rama-local` → `main` y aprobarlo.
+
+El pipeline de GitHub Actions se ejecuta automáticamente al crear el PR y valida:
+- `ansible-lint` — sintaxis de los playbooks
+- `yamllint` — sintaxis de los archivos YAML
 
 ---
 
-### Parte 7 — Conectar ArgoCD con GitLab
+### Parte 7 — Conectar ArgoCD con GitHub
 
-Una vez que ArgoCD está corriendo, conectarlo al repositorio de GitLab desde la interfaz web:
+Una vez que ArgoCD está corriendo, conectarlo al repositorio de GitHub desde la interfaz web:
 
 1. Entrar a ArgoCD → **Settings** → **Repositories**
 2. Click **Connect Repo**
-3. Completar:
-   - URL: `https://gitlab.com/tu-usuario/tu-repo.git`
-   - Username: tu usuario de GitLab
-   - Password: tu Personal Access Token
-4. Click **Connect**
+3. Seleccionar **VIA HTTP/HTTPS**
+4. Completar:
+   - Repository URL: `https://github.com/tu-usuario/tu-repo.git`
+   - Username: tu usuario de GitHub
+   - Password: tu Personal Access Token de GitHub
+5. Click **Connect**
+
+Si aparece error de DNS, corregir CoreDNS en K3s:
+```bash
+sudo kubectl edit configmap coredns -n kube-system
+# Cambiar: forward . /etc/resolv.conf
+# Por:     forward . 8.8.8.8 8.8.4.4
+sudo kubectl rollout restart deployment coredns -n kube-system
+```
 
 ---
 
-### Parte 8 — Conectar AWX con GitLab
+### Parte 8 — Configurar ArgoCD con GitOps (App of Apps)
 
-Desde la interfaz web de AWX:
+Esta es la parte más importante — hacer que ArgoCD se gestione a sí mismo y gestione AWX desde Git.
 
-1. **Projects** → **Add**
+**Estructura en el repositorio:**
+```
+k8s/
+├── awx/
+│   ├── kustomization.yaml    ← manifiestos de AWX
+│   └── awx-instance.yml
+└── argocd/
+    ├── awx-app.yml           ← Application de AWX
+    └── argocd-app.yml        ← Application de ArgoCD (self-manage)
+```
+
+**k8s/argocd/awx-app.yml:**
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: awx
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/tu-usuario/tu-repo.git
+    targetRevision: main
+    path: k8s/awx
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: awx
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+**k8s/argocd/argocd-app.yml:**
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: argocd-self
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/tu-usuario/tu-repo.git
+    targetRevision: main
+    path: k8s/argocd
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+**Crear las Applications en ArgoCD:**
+
+En ArgoCD → **Applications** → **New App**:
+
+Para AWX:
+- Application Name: `awx`
+- Path: `k8s/awx`
+- Namespace: `awx`
+
+Para ArgoCD self-managed:
+- Application Name: `argocd-self`
+- Path: `k8s/argocd`
+- Namespace: `argocd`
+
+Una vez creadas, ArgoCD detecta automáticamente todos los manifiestos en esas carpetas y los aplica. Cualquier cambio en GitHub se refleja automáticamente en el cluster.
+
+**Lo que ArgoCD gestiona en AWX (árbol de recursos):**
+```
+awx (Application)
+├── CRDs (tipos de objetos K8s de AWX)
+│   ├── awxbackups.awx.ansible.com
+│   ├── awxmeshingresses.awx.ansible.com
+│   ├── awxrestores.awx.ansible.com
+│   └── awxs.awx.ansible.com
+├── AWX Operator (el cerebro)
+│   └── awx-operator-controller-manager
+├── Pods principales
+│   ├── awx-web        ← interfaz web
+│   ├── awx-task       ← motor de playbooks
+│   └── awx-postgres   ← base de datos
+└── Configuración
+    ├── awx-app-credentials
+    └── awx-postgres-15 (secret)
+```
+
+---
+
+### Parte 9 — Conectar AWX con GitHub
+
+Desde la interfaz web de AWX (`http://IP:30080`):
+
+**Paso 1 — Crear credencial de GitHub:**
+1. **Recursos** → **Credenciales** → **Agregar**
 2. Completar:
-   - Name: `Ansible Empresa`
-   - SCM Type: `Git`
-   - SCM URL: `https://gitlab.com/tu-usuario/tu-repo.git`
-   - SCM Branch: `main`
-   - SCM Credential: agregar el Personal Access Token de GitLab
-3. Click **Save**
+   - Nombre: `GitHub Token`
+   - Tipo de credencial: `Fuente de control` (Source Control en inglés)
+   - Usuario: tu usuario de GitHub
+   - Contraseña: tu Personal Access Token
+3. Click **Guardar**
 
-AWX va a sincronizar el repositorio y los playbooks van a estar disponibles para ejecutar.
+**Paso 2 — Crear el Proyecto:**
+
+Si la interfaz web no responde al guardar, crear el proyecto via API desde el servidor:
+
+```bash
+# Obtener token de AWX
+AWX_TOKEN=$(sudo kubectl exec -n awx deployment/awx-web -- awx-manage create_oauth2_token --user admin 2>/dev/null | tail -1)
+
+# Crear el proyecto
+curl -s -X POST http://IP-SERVIDOR:30080/api/v2/projects/ \
+  -H "Authorization: Bearer $AWX_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "Ansible Kubernetes AWX",
+    "scm_type": "git",
+    "scm_url": "https://github.com/tu-usuario/tu-repo.git",
+    "scm_branch": "main",
+    "scm_update_on_launch": true,
+    "credential": null
+  }' | python3 -m json.tool
+
+# Obtener ID de la credencial
+curl -s http://IP-SERVIDOR:30080/api/v2/credentials/ \
+  -H "Authorization: Bearer $AWX_TOKEN" | python3 -m json.tool | grep -B15 '"name": "GitHub Token"' | grep '"id"'
+
+# Asociar credencial al proyecto (reemplazar 8 con el ID del proyecto y 42 con el ID de la credencial)
+curl -s -X PATCH http://IP-SERVIDOR:30080/api/v2/projects/8/ \
+  -H "Authorization: Bearer $AWX_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"credential": 42}'
+
+# Sincronizar el proyecto con GitHub
+curl -s -X POST http://IP-SERVIDOR:30080/api/v2/projects/8/update/ \
+  -H "Authorization: Bearer $AWX_TOKEN" \
+  -H "Content-Type: application/json"
+
+# Verificar estado
+curl -s http://IP-SERVIDOR:30080/api/v2/projects/8/ \
+  -H "Authorization: Bearer $AWX_TOKEN" | python3 -m json.tool | grep -E '"status"|"scm_revision"'
+```
+
+El resultado esperado:
+```
+"status": "successful"
+"scm_revision": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+```
+
+AWX sincroniza el repositorio y los playbooks quedan disponibles para ejecutar desde la interfaz web.
+
+---
+
+## Estado final de la instalación
+
+Una vez completados todos los pasos el stack queda así:
+
+```
+Servidor Linux Ubuntu 22.04
+└── K3s (Kubernetes)
+    ├── AWX 24.6.1              → http://IP:30080
+    │   ├── Estado: Running
+    │   ├── Proyecto: sincronizado con GitHub
+    │   └── Credencial: GitHub Token configurada
+    └── ArgoCD v3.3.6           → http://IP:31046
+        ├── Estado: Running
+        ├── App awx: Healthy + Synced
+        └── App argocd-self: Healthy + Synced
+
+GitHub
+├── Repositorio con estructura completa
+├── GitHub Actions (CI/CD funcionando)
+├── Rama main (default, protegida)
+└── Rama de trabajo para Pull Requests
+```
+
+### Verificación final del cluster
+
+```bash
+# Ver todos los pods corriendo
+sudo kubectl get pods -A
+
+# Ver namespaces
+sudo kubectl get namespaces
+
+# Ver aplicaciones en ArgoCD
+sudo kubectl get applications -n argocd
+
+# Ver proyecto en AWX
+curl -s http://IP:30080/api/v2/projects/ \
+  -H "Authorization: Bearer TOKEN" | python3 -m json.tool | grep -E '"name"|"status"'
+```
+
+### Próximos pasos
+
+Con el ambiente funcionando los próximos pasos son:
+
+1. Crear un **inventario** en AWX con los servidores a gestionar
+2. Configurar **credenciales SSH** para conectarse a los servidores
+3. Crear una **plantilla de trabajo** apuntando a un playbook del repo
+4. Escribir los primeros **playbooks reales** para automatizar tareas
+5. Configurar **schedules** para ejecuciones automáticas
 
 ---
 
