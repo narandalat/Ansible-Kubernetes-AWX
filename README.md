@@ -573,6 +573,48 @@ Si ya tienen recursos creados por K8s que no están en Terraform, estas herramie
 | **Flux** | Alternativa a ArgoCD para GitOps en Kubernetes |
 | **Ansible** | Configurar servidores Linux y Windows, backups, tareas operativas |
 | **AWX** | Interfaz web y API para gestionar y ejecutar Ansible |
+| **GitLab CI** | Pipelines de CI/CD para el repositorio de Ansible/K8s |
+| **GitHub Actions** | Pipelines de CI/CD para el repositorio de Terraform |
+| **Terraform Cloud** | Ejecuta plan y apply de Terraform, gestiona el state |
+| **Jenkins** | Alternativa a GitLab CI/GitHub Actions, más flexible pero más complejo |
+
+---
+
+### Pipelines de CI/CD — cómo encaja cada repositorio
+
+Este proyecto usa dos repositorios con sus propias herramientas de CI/CD:
+
+**Repositorio Ansible/K8s (GitLab)**
+```
+git push a naranda-local
+        ↓
+GitLab CI ejecuta:
+├── ansible-lint    ← valida playbooks
+└── yamllint        ← valida YAMLs
+        ↓
+Merge Request a main
+        ↓
+ArgoCD detecta el merge
+└── Aplica cambios en K3s automáticamente
+```
+
+**Repositorio Terraform (GitHub)**
+```
+git push / Pull Request
+        ↓
+GitHub Actions ejecuta:
+├── terraform fmt     ← formato correcto?
+└── terraform validate ← sintaxis correcta?
+        ↓
+Terraform Cloud ejecuta:
+├── terraform plan    ← qué va a cambiar en AWS?
+└── terraform apply   ← aprobación manual requerida
+        ↓
+Infraestructura AWS creada/modificada
+```
+
+**Por qué GitHub Actions + Terraform Cloud para Terraform:**
+GitHub Actions valida rápido (formato y sintaxis) mientras que Terraform Cloud gestiona el state de forma segura y provee la interfaz de aprobación para el apply. Es la combinación más usada en el mercado cuando el código vive en GitHub.
 
 ---
 
@@ -620,6 +662,276 @@ ansible-playbook playbooks/health_check.yml -i inventories/dev/hosts.yml
 # Ejecutar contra producción (requiere confirmación del equipo)
 ansible-playbook playbooks/health_check.yml -i inventories/prod/hosts.yml
 ```
+
+---
+
+---
+
+## Instalación y despliegue
+
+Esta sección documenta todos los pasos para levantar el stack completo desde cero: servidor Linux, K3s, AWX y ArgoCD.
+
+### Requisitos del servidor
+
+| Recurso | Mínimo | Recomendado |
+|---|---|---|
+| CPU | 4 cores | 8 cores |
+| RAM | 8 GB | 16 GB |
+| Disco | 50 GB | 80 GB |
+| OS | Ubuntu 22.04 LTS | Ubuntu 22.04 LTS |
+
+---
+
+### Parte 1 — Preparar el servidor Linux
+
+Conectarse por SSH al servidor y ejecutar:
+
+```bash
+# Actualizar el sistema
+sudo apt update && sudo apt upgrade -y
+
+# Instalar dependencias base
+sudo apt install -y curl git wget
+
+# Deshabilitar swap (requerido por K3s)
+sudo swapoff -a
+sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+# Verificar que swap quedó en 0
+free -h
+```
+
+---
+
+### Parte 2 — Instalar K3s
+
+```bash
+# Instalar K3s con un solo comando
+curl -sfL https://get.k3s.io | sh -
+
+# Verificar que el nodo esté Ready
+sudo kubectl get nodes
+```
+
+La salida esperada:
+```
+NAME    STATUS   ROLES                  AGE   VERSION
+vm-01   Ready    control-plane,master   1m    v1.34.x+k3s1
+```
+
+---
+
+### Parte 3 — Instalar Helm
+
+Helm es el gestor de paquetes de Kubernetes, necesario para instalar componentes:
+
+```bash
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Verificar instalación
+helm version
+```
+
+---
+
+### Parte 4 — Instalar AWX
+
+AWX es la interfaz web gratuita de Ansible (equivalente a Ansible Tower).
+
+**Crear carpeta de trabajo:**
+```bash
+sudo mkdir -p /opt/awx-install && cd /opt/awx-install
+```
+
+**Crear el archivo kustomization.yaml:**
+```bash
+sudo cat <<EOF > /opt/awx-install/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - github.com/ansible/awx-operator/config/default?ref=2.19.1
+images:
+  - name: quay.io/ansible/awx-operator
+    newTag: 2.19.1
+namespace: awx
+EOF
+```
+
+**Verificar el archivo:**
+```bash
+cat /opt/awx-install/kustomization.yaml
+```
+
+**Aplicar el operator:**
+```bash
+sudo kubectl apply -k /opt/awx-install/
+```
+
+**Esperar que el operator esté corriendo** (3-5 minutos):
+```bash
+sudo kubectl get pods -n awx -w
+```
+
+Esperar hasta ver `2/2 Running`:
+```
+NAME                                               READY   STATUS
+awx-operator-controller-manager-xxxxxxxxx-xxxxx   2/2     Running
+```
+
+**Crear el archivo de instancia AWX:**
+```bash
+sudo cat <<EOF > /opt/awx-install/awx-instance.yml
+apiVersion: awx.ansible.com/v1beta1
+kind: AWX
+metadata:
+  name: awx
+  namespace: awx
+spec:
+  service_type: nodeport
+  nodeport_port: 30080
+EOF
+```
+
+**Agregar la instancia al kustomization.yaml:**
+```bash
+sudo cat <<EOF > /opt/awx-install/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - github.com/ansible/awx-operator/config/default?ref=2.19.1
+  - awx-instance.yml
+images:
+  - name: quay.io/ansible/awx-operator
+    newTag: 2.19.1
+namespace: awx
+EOF
+```
+
+**Aplicar la instancia:**
+```bash
+sudo kubectl apply -k /opt/awx-install/
+```
+
+**Monitorear el despliegue** (puede tardar 10-15 minutos):
+```bash
+sudo kubectl get pods -n awx -w
+```
+
+Esperar hasta ver todos los pods en Running:
+```
+NAME                                               READY   STATUS
+awx-operator-controller-manager-xxxxxxxxx-xxxxx   2/2     Running
+awx-postgres-xx-x                                  1/1     Running
+awx-xxxxxxxxx-xxxxx                                4/4     Running
+```
+
+**Obtener la contraseña de admin:**
+```bash
+sudo kubectl get secret awx-admin-password -o jsonpath="{.data.password}" -n awx | base64 --decode && echo
+```
+
+**Acceder a AWX:**
+```
+http://IP-DEL-SERVIDOR:30080
+Usuario: admin
+Contraseña: la obtenida en el paso anterior
+```
+
+---
+
+### Parte 5 — Instalar ArgoCD
+
+ArgoCD implementa GitOps — monitorea el repositorio Git y aplica los cambios automáticamente en el cluster.
+
+```bash
+# Crear namespace
+sudo kubectl create namespace argocd
+
+# Instalar ArgoCD
+sudo kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# Esperar que todos los pods estén Running
+sudo kubectl get pods -n argocd -w
+```
+
+**Exponer la interfaz web:**
+```bash
+sudo kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "NodePort"}}'
+
+# Ver el puerto asignado
+sudo kubectl get svc argocd-server -n argocd
+```
+
+**Obtener la contraseña inicial de admin:**
+```bash
+sudo kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 --decode && echo
+```
+
+**Acceder a ArgoCD:**
+```
+http://IP-DEL-SERVIDOR:PUERTO-NODEPORT
+Usuario: admin
+Contraseña: la obtenida en el paso anterior
+```
+
+---
+
+### Parte 6 — Configurar el repositorio en tu PC
+
+**En tu PC con VS Code:**
+
+```powershell
+# Inicializar Git en la carpeta del proyecto
+git init
+
+# Conectar con GitLab
+git remote add origin https://gitlab.com/tu-usuario/tu-repo.git
+
+# Configurar credencial (usar Personal Access Token de GitLab)
+git remote set-url origin https://tu-usuario:TU_TOKEN@gitlab.com/tu-usuario/tu-repo.git
+
+# Crear rama main y rama de trabajo
+git checkout -b main
+git checkout -b tu-rama-local
+
+# Primer commit y push
+git add .
+git commit -m "feat: estructura inicial del proyecto"
+git push -u origin tu-rama-local
+```
+
+Desde GitLab crear un Merge Request de `tu-rama-local` → `main` y aprobarlo.
+
+---
+
+### Parte 7 — Conectar ArgoCD con GitLab
+
+Una vez que ArgoCD está corriendo, conectarlo al repositorio de GitLab desde la interfaz web:
+
+1. Entrar a ArgoCD → **Settings** → **Repositories**
+2. Click **Connect Repo**
+3. Completar:
+   - URL: `https://gitlab.com/tu-usuario/tu-repo.git`
+   - Username: tu usuario de GitLab
+   - Password: tu Personal Access Token
+4. Click **Connect**
+
+---
+
+### Parte 8 — Conectar AWX con GitLab
+
+Desde la interfaz web de AWX:
+
+1. **Projects** → **Add**
+2. Completar:
+   - Name: `Ansible Empresa`
+   - SCM Type: `Git`
+   - SCM URL: `https://gitlab.com/tu-usuario/tu-repo.git`
+   - SCM Branch: `main`
+   - SCM Credential: agregar el Personal Access Token de GitLab
+3. Click **Save**
+
+AWX va a sincronizar el repositorio y los playbooks van a estar disponibles para ejecutar.
 
 ---
 
